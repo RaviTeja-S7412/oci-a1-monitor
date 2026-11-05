@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.oci/
+oci_config
+monitor.lock
+monitor.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Keep the persistent state file tracked by Git.
+# Do not ignore state/monitor_state.json.
