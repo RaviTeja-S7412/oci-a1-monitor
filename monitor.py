@@ -11,10 +11,12 @@ from pathlib import Path
 import oci
 import settings
 
+
 ROOT = Path(__file__).resolve().parent
-STATE_PATH = ROOT / settings.STATE_PATH
+STATE_PATH = Path(settings.STATE_PATH)
+if not STATE_PATH.is_absolute():
+    STATE_PATH = ROOT / STATE_PATH
 LOCK_PATH = ROOT / "monitor.lock"
-LOG_PATH = ROOT / "monitor.log"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +24,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("oci-a1-monitor")
+
+# TERMINATING is transitional; only TERMINATED is treated as final.
+TERMINAL_STATES = {"TERMINATED"}
 
 
 def utc_now():
@@ -31,13 +36,32 @@ def utc_now():
 def load_state():
     if not STATE_PATH.exists():
         return {"status": "ready"}
+
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(
             f"Cannot parse {STATE_PATH}; refusing to launch to avoid a duplicate. "
             f"Inspect and repair the state file. Details: {exc}"
+        ) from exc
+
+    if not isinstance(state, dict) or not isinstance(state.get("status"), str):
+        raise RuntimeError("Monitor state has an invalid structure; refusing to launch.")
+
+    allowed = {
+        "ready",
+        "launch_pending",
+        "launch_unknown",
+        "created",
+        "blocked_existing_a1",
+        "launch_error",
+        "terminal_instance",
+    }
+    if state["status"] not in allowed:
+        raise RuntimeError(
+            f"Unknown monitor state {state['status']!r}; refusing to launch."
         )
+    return state
 
 
 def save_state(state):
@@ -49,13 +73,14 @@ def save_state(state):
 
 class ProcessLock:
     """Linux process lock; GitHub Actions concurrency is an additional guard."""
+
     def __enter__(self):
         self.handle = open(LOCK_PATH, "w")
         try:
             fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
             self.handle.close()
-            raise RuntimeError("Another monitor process is already running.")
+            raise RuntimeError("Another monitor process is already running.") from exc
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -71,10 +96,7 @@ def make_clients():
         raise RuntimeError(
             f"OCI config region is {config.get('region')!r}; expected {settings.REGION!r}."
         )
-    return (
-        oci.core.ComputeClient(config),
-        oci.ons.NotificationDataPlaneClient(config),
-    )
+    return oci.core.ComputeClient(config), oci.ons.NotificationDataPlaneClient(config)
 
 
 def validate_config():
@@ -88,8 +110,10 @@ def validate_config():
         raise RuntimeError("Region mismatch: this monitor is configured for Hyderabad.")
     if settings.SHAPE != "VM.Standard.A1.Flex" or settings.OCPUS != 2 or settings.MEMORY_GB != 12:
         raise RuntimeError("Unexpected compute configuration; review the Always Free target.")
-    if settings.BOOT_VOLUME_SIZE_GB < 50:
-        raise RuntimeError("OCI boot volume must be at least 50 GB.")
+    if settings.BOOT_VOLUME_SIZE_GB != 50:
+        raise RuntimeError("Expected a 50 GB boot volume; review the Always Free target.")
+    if not settings.IMAGE_ID or not settings.SUBNET_ID or not settings.AVAILABILITY_DOMAIN:
+        raise RuntimeError("Image, subnet, and availability domain must be configured.")
 
 
 def send_notification(ons, title, body):
@@ -102,8 +126,29 @@ def send_notification(ons, title, body):
     log.info("Notification published. Message ID: %s", response.data.message_id)
 
 
+def queue_notification(state, title, body):
+    state["pending_notification"] = {
+        "title": title,
+        "body": body,
+        "queued_at": utc_now(),
+    }
+
+
+def deliver_pending_notification(ons, state):
+    pending = state.get("pending_notification")
+    if not pending:
+        return
+    try:
+        send_notification(ons, pending["title"], pending["body"])
+    except Exception:
+        # Keep the message in state so a later scheduled run can retry it.
+        log.exception("Notification delivery failed; it will be retried on a later run.")
+        return
+    state.pop("pending_notification", None)
+    save_state(state)
+
+
 def list_a1_instances(compute):
-    """Inspect all instances in the target AD; don't assume an unrelated A1 is ours."""
     response = oci.pagination.list_call_get_all_results(
         compute.list_instances,
         compartment_id=settings.COMPARTMENT_ID,
@@ -111,8 +156,7 @@ def list_a1_instances(compute):
     )
     return [
         inst for inst in response.data
-        if inst.shape == settings.SHAPE
-        and inst.lifecycle_state not in ("TERMINATED", "TERMINATING")
+        if inst.shape == settings.SHAPE and inst.lifecycle_state not in TERMINAL_STATES
     ]
 
 
@@ -142,10 +186,83 @@ def launch_details():
     )
 
 
+def record_instance(compute, ons, state, instance, source):
+    state.update({
+        "status": "created",
+        "instance_id": instance.id,
+        "instance_name": instance.display_name,
+        "lifecycle_state": instance.lifecycle_state,
+        "last_lifecycle_check_at": utc_now(),
+        "retry_token": None,
+    })
+    state.pop("launch_error", None)
+    queue_notification(
+        state,
+        "OCI A1 instance detected" if source == "discovered" else "OCI A1 instance launch accepted",
+        (
+            f"Monitor-managed OCI A1 instance {source}.\n"
+            f"Name: {instance.display_name}\n"
+            f"OCID: {instance.id}\n"
+            f"Initial/current state: {instance.lifecycle_state}\n"
+            f"Region: {settings.REGION}\n"
+            "The monitor will not submit another launch request."
+        ),
+    )
+    save_state(state)
+    log.info(
+        "Instance %s; lifecycle state is %s. Future runs will monitor this OCID only.",
+        instance.id,
+        instance.lifecycle_state,
+    )
+
+
+def monitor_saved_instance(compute, ons, state):
+    instance_id = state.get("instance_id")
+    if not instance_id:
+        raise RuntimeError("State says an instance was created but has no instance OCID.")
+
+    try:
+        instance = compute.get_instance(instance_id).data
+    except oci.exceptions.ServiceError as exc:
+        state["last_lifecycle_check_at"] = utc_now()
+        state["last_lifecycle_error"] = f"{exc.code}: {exc.message}"
+        save_state(state)
+        log.error(
+            "Could not retrieve saved instance %s. No new launch will be attempted: %s",
+            instance_id,
+            exc,
+        )
+        return
+
+    state.update({
+        "status": "created",
+        "instance_name": instance.display_name,
+        "lifecycle_state": instance.lifecycle_state,
+        "last_lifecycle_check_at": utc_now(),
+    })
+
+    if instance.lifecycle_state in TERMINAL_STATES:
+        state["status"] = "terminal_instance"
+        state["terminal_at"] = utc_now()
+        queue_notification(
+            state,
+            "OCI A1 instance entered a terminal state",
+            f"Instance {instance.id} is {instance.lifecycle_state}. "
+            "Automatic relaunch is disabled to prevent duplicate or unexpected resources. "
+            "Review the OCI Console before changing monitor state.",
+        )
+    save_state(state)
+    log.info(
+        "Monitoring existing instance %s: lifecycle state=%s. No launch request will be made.",
+        instance.id,
+        instance.lifecycle_state,
+    )
+
+
 def main():
-    parser = argparse.ArgumentParser(description="One-shot OCI A1 monitor / provisioner")
+    parser = argparse.ArgumentParser(description="OCI A1 monitor / provisioner")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--dry-run", action="store_true", help="Validate; never launch")
+    group.add_argument("--dry-run", action="store_true", help="Validate and inspect; never launch")
     group.add_argument("--launch", action="store_true", help="Submit a real OCI launch request")
     args = parser.parse_args()
 
@@ -154,56 +271,66 @@ def main():
         compute, ons = make_clients()
         state = load_state()
 
-        if state.get("status") == "created":
-            log.info(
-                "Provisioning already succeeded (instance OCID %s). Nothing to do.",
-                state.get("instance_id"),
-            )
+        # Deliver a previously queued email independently of provisioning.
+        deliver_pending_notification(ons, state)
+
+        if state["status"] in {"created", "terminal_instance"}:
+            monitor_saved_instance(compute, ons, state)
             return 0
 
+        if state["status"] == "blocked_existing_a1":
+            log.warning("Provisioning remains blocked by a previously detected unrelated A1 instance.")
+            return 0
+
+        # Always inspect OCI before deciding how to handle an ambiguous launch.
+        # The original request may have succeeded even if its response was lost.
         instances = list_a1_instances(compute)
         if instances:
-            # An A1 already exists. Only call it ours if it carries our management tag.
             managed = next(
                 (i for i in instances if (i.freeform_tags or {}).get("managed-by") == "oci-a1-monitor"),
                 None,
             )
             if managed:
-                state.update({
-                    "status": "created",
-                    "instance_id": managed.id,
-                    "instance_name": managed.display_name,
-                    "lifecycle_state": managed.lifecycle_state,
-                    "discovered_at": utc_now(),
-                })
-                save_state(state)
-                send_notification(
-                    ons,
-                    "OCI A1 instance detected",
-                    f"Monitor-managed instance found.\nName: {managed.display_name}\n"
-                    f"OCID: {managed.id}\nState: {managed.lifecycle_state}",
-                )
-                log.info("Found monitor-managed A1 instance; monitoring will stop.")
+                record_instance(compute, ons, state, managed, "discovered")
                 return 0
+
+            if state["status"] == "launch_unknown":
+                log.error(
+                    "Previous launch outcome is ambiguous and no monitor-tagged A1 "
+                    "instance is currently visible. Automatic launch remains paused; "
+                    "reconcile in OCI Console before resetting state."
+                )
+                return 2
 
             state.update({
                 "status": "blocked_existing_a1",
                 "existing_instance_ids": [i.id for i in instances],
                 "last_checked_at": utc_now(),
             })
-            save_state(state)
-            log.warning("An A1 instance already exists in the target AD but is not tagged as monitor-managed.")
-            send_notification(
-                ons,
+            queue_notification(
+                state,
                 "OCI A1 monitor paused: existing A1 found",
                 "An A1 instance already exists in the configured availability domain, "
                 "but it is not tagged as managed by this monitor. No launch was attempted. "
                 "Review the OCI Console and state/monitor_state.json.",
             )
+            save_state(state)
+            log.warning("Unmanaged A1 instance found; provisioning is blocked.")
             return 0
 
+        if state["status"] == "launch_unknown":
+            log.error(
+                "Previous launch outcome is ambiguous and no monitor-tagged A1 "
+                "instance is currently visible. Automatic launch remains paused; "
+                "reconcile in OCI Console before resetting state."
+            )
+            return 2
+
         if args.dry_run:
-            log.info("DRY RUN passed: OCI authentication, configuration and capacity checks completed. No launch submitted.")
+            log.info(
+                "DRY RUN passed: OCI authentication, configuration and instance discovery "
+                "completed. OCI capacity is not reserved or guaranteed. No launch submitted."
+            )
             return 0
 
         if not settings.ENABLE_REAL_LAUNCH:
@@ -212,8 +339,17 @@ def main():
                 "only after reviewing the configuration and Always Free eligibility."
             )
 
-        # Keep an idempotency token only while an outcome is ambiguous. A known
-        # capacity/rate-limit response gets a fresh token on the next scheduled run.
+        # A previous launch_pending state is treated as ambiguous and is never blindly resubmitted.
+        if state["status"] == "launch_pending":
+            state["status"] = "launch_unknown"
+            state["last_recovery_check_at"] = utc_now()
+            save_state(state)
+            log.error(
+                "Found launch_pending without a confirmed instance. Pausing for manual "
+                "reconciliation; no second launch request will be submitted."
+            )
+            return 2
+
         token = state.get("retry_token") or str(uuid.uuid4())
         state.update({
             "status": "launch_pending",
@@ -225,52 +361,50 @@ def main():
 
         try:
             response = compute.launch_instance(launch_details(), opc_retry_token=token)
-            inst = response.data
-            state.update({
-                "status": "created",
-                "instance_id": inst.id,
-                "instance_name": inst.display_name,
-                "lifecycle_state": inst.lifecycle_state,
-                "created_at": utc_now(),
-                "retry_token": None,
-            })
-            save_state(state)
-            send_notification(
-                ons,
-                "OCI A1 instance launch accepted",
-                f"OCI accepted the instance launch request.\nName: {inst.display_name}\n"
-                f"OCID: {inst.id}\nInitial state: {inst.lifecycle_state}\n"
-                f"Region: {settings.REGION}\nCheck OCI Console for provisioning completion and public IP.",
-            )
-            log.info("Launch accepted. Subsequent scheduled runs will exit without launching.")
+            record_instance(compute, ons, state, response.data, "accepted")
             return 0
 
         except oci.exceptions.ServiceError as exc:
             state.update({
-                "status": "launch_error",
                 "last_error_code": exc.code,
                 "last_error_message": exc.message,
                 "last_error_status": exc.status,
                 "last_error_at": utc_now(),
             })
-            # These are definitive responses; generate a new idempotency token next time.
-            if exc.status == 429 or "capacity" in (exc.message or "").lower() or exc.code in (
-                "TooManyRequests", "LimitExceeded"
+
+            if (
+                exc.status == 429
+                or "capacity" in (exc.message or "").lower()
+                or exc.code in ("TooManyRequests", "LimitExceeded")
             ):
-                state["retry_token"] = None
+                state.update({"status": "ready", "retry_token": None})
                 save_state(state)
-                log.warning("Capacity/rate/limit response; no immediate retry. Next scheduled run will check again.")
+                log.warning(
+                    "Definitive capacity/rate/limit response. No immediate retry; "
+                    "the next scheduled run will check again."
+                )
             else:
-                # Preserve token for review; don't automatically hammer on unknown errors.
+                # Treat every other service error conservatively until reconciled.
+                state["status"] = "launch_unknown"
                 state["retry_token"] = token
                 save_state(state)
-                log.error("OCI launch error %s (HTTP %s): %s", exc.code, exc.status, exc.message)
+                log.error(
+                    "OCI returned an unexpected launch error %s (HTTP %s): %s. "
+                    "Automatic retries are paused to prevent duplicates.",
+                    exc.code,
+                    exc.status,
+                    exc.message,
+                )
             return 2
 
         except Exception:
-            # A timeout or unexpected transport error may have an ambiguous outcome.
-            # Preserve token; next run checks OCI for the instance before any retry.
-            log.exception("Unexpected launch outcome. State/token retained for safe recovery.")
+            state["status"] = "launch_unknown"
+            state["retry_token"] = token
+            state["last_error_at"] = utc_now()
+            save_state(state)
+            log.exception(
+                "Unexpected launch outcome. State/token retained; automatic retries paused."
+            )
             raise
 
 

@@ -66,7 +66,7 @@ jobs:
           OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
           ENABLE_REAL_LAUNCH: ${{ secrets.ENABLE_REAL_LAUNCH }}
           OCI_MONITOR_STATE_PATH: state/monitor_state.json
-        run: python monitor.py --dry-run
+        run: python monitor.py --launch
 
       - name: Persist monitoring state
         if: always()
