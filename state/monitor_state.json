@@ -1,3 +1,10 @@
 {
-  "status": "ready"
+  "status": "ready",
+  "retry_token": null,
+  "launch_attempt_started_at": "2026-11-05T13:57:39.649783+00:00",
+  "instance_name": "oci-a1-free-server",
+  "last_error_code": "InternalError",
+  "last_error_message": "Out of host capacity.",
+  "last_error_status": 500,
+  "last_error_at": "2026-11-05T13:57:41.669228+00:00"
 }
