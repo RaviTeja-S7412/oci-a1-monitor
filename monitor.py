@@ -383,6 +383,7 @@ def main():
                     "Definitive capacity/rate/limit response. No immediate retry; "
                     "the next scheduled run will check again."
                 )
+                return 0
             else:
                 # Treat every other service error conservatively until reconciled.
                 state["status"] = "launch_unknown"
@@ -395,7 +396,7 @@ def main():
                     exc.status,
                     exc.message,
                 )
-            return 2
+                return 2
 
         except Exception:
             state["status"] = "launch_unknown"
