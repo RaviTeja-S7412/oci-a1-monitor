@@ -33,6 +33,16 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def write_step_summary(markdown_text):
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(markdown_text + "\n")
+        except Exception:
+            pass
+
+
 def load_state():
     if not STATE_PATH.exists():
         return {"status": "ready"}
@@ -362,6 +372,14 @@ def main():
         try:
             response = compute.launch_instance(launch_details(), opc_retry_token=token)
             record_instance(compute, ons, state, response.data, "accepted")
+            write_step_summary(
+                "## 🎉 OCI Instance Successfully Created!\n\n"
+                f"- **Instance ID**: `{response.data.id}`\n"
+                f"- **Display Name**: `{response.data.display_name}`\n"
+                f"- **Lifecycle State**: `{response.data.lifecycle_state}`\n"
+                f"- **Availability Domain**: `{response.data.availability_domain}`\n"
+                f"- **Region**: `{settings.REGION}`\n"
+            )
             return 0
 
         except oci.exceptions.ServiceError as exc:
@@ -372,6 +390,13 @@ def main():
                 "last_error_at": utc_now(),
             })
 
+            log.info(
+                "OCI Launch API Response: HTTP %s | Code: %s | Message: %s",
+                exc.status,
+                exc.code,
+                exc.message,
+            )
+
             if (
                 exc.status == 429
                 or "capacity" in (exc.message or "").lower()
@@ -380,8 +405,21 @@ def main():
                 state.update({"status": "ready", "retry_token": None})
                 save_state(state)
                 log.warning(
-                    "Definitive capacity/rate/limit response. No immediate retry; "
-                    "the next scheduled run will check again."
+                    "Capacity unavailable from Oracle (HTTP %s - %s: %s). "
+                    "State reset to ready; next scheduled run will check again.",
+                    exc.status,
+                    exc.code,
+                    exc.message,
+                )
+                write_step_summary(
+                    "## ⚠️ OCI Launch Attempt - Out of Capacity\n\n"
+                    f"- **Timestamp**: `{utc_now()}`\n"
+                    f"- **HTTP Status**: `{exc.status}`\n"
+                    f"- **Oracle Error Code**: `{exc.code}`\n"
+                    f"- **Oracle Message**: `{exc.message}`\n"
+                    f"- **Target Availability Domain**: `{settings.AVAILABILITY_DOMAIN}`\n"
+                    f"- **Target Shape**: `{settings.SHAPE} ({settings.OCPUS} OCPUs, {settings.MEMORY_GB} GB RAM)`\n\n"
+                    "> **Summary**: Oracle Cloud actively evaluated the request and reported that physical host capacity is temporarily exhausted in this availability domain. The monitor reset its state and will try again automatically on the next scheduled run."
                 )
                 return 0
             else:
@@ -395,6 +433,12 @@ def main():
                     exc.code,
                     exc.status,
                     exc.message,
+                )
+                write_step_summary(
+                    "## ❌ OCI Unexpected Launch Error\n\n"
+                    f"- **HTTP Status**: `{exc.status}`\n"
+                    f"- **Error Code**: `{exc.code}`\n"
+                    f"- **Message**: `{exc.message}`\n"
                 )
                 return 2
 
