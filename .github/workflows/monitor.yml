@@ -2,8 +2,11 @@ name: OCI A1 Capacity Monitor
 
 on:
   schedule:
-    # Every 3 hours with offset to avoid top-of-hour GitHub Actions traffic
-    - cron: "17 */3 * * *"
+    # Every 1.5 hours (90 minutes): 16 runs per day
+    # Run 1: 00:17, 03:17, 06:17, 09:17, 12:17, 15:17, 18:17, 21:17 UTC
+    - cron: "17 0,3,6,9,12,15,18,21 * * *"
+    # Run 2: 01:47, 04:47, 07:47, 10:47, 13:47, 16:47, 19:47, 22:47 UTC
+    - cron: "47 1,4,7,10,13,16,19,22 * * *"
   workflow_dispatch:
 
 permissions:
